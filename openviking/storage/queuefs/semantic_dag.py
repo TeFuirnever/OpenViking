@@ -15,6 +15,7 @@ from openviking.storage.viking_fs import LS_ALL_NODES, get_viking_fs
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.utils.ingest_options import IngestOptions
 from openviking_cli.utils import VikingURI
+from openviking_cli.utils.config import get_openviking_config
 from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -85,6 +86,93 @@ class DagWork:
 class ScheduledDagWork:
     executor: "SemanticDagExecutor"
     work: DagWork
+
+
+class SummaryBudget:
+    """Concurrency-safe per-task aggregate VLM input limit for summary/overview generation.
+
+    Tracks cumulative characters of rendered prompt input sent to the VLM
+    across file summaries, directory overviews, and batched overview merges.
+    When a single call's prompt would exceed the remaining budget, that call
+    is rejected and an empty summary/overview is returned so that indexing
+    and embedding can continue. Smaller subsequent calls may still succeed
+    if they fit within what remains — the limit is aggregate, not a
+    one-shot exhaustion gate.
+
+    A budget of 0 means unlimited (no enforcement).
+    """
+
+    def __init__(self, budget_chars: int):
+        self._budget = max(0, budget_chars)
+        self._remaining = self._budget
+        self._lock = threading.Lock()
+        self._rejected = False  # monotonic: set True on first reservation failure
+        self._warning_taken = False  # one-time latch: True after warning is claimed
+
+    @property
+    def unlimited(self) -> bool:
+        return self._budget == 0
+
+    @property
+    def exhausted(self) -> bool:
+        """True when remaining budget is zero or negative (no call can fit).
+
+        Note that a call may be rejected before the aggregate limit is
+        fully spent if that single prompt is larger than the remainder.
+        """
+        if self._budget == 0:
+            return False
+        with self._lock:
+            return self._remaining <= 0
+
+    def try_reserve(self, cost: int) -> bool:
+        """Attempt to reserve ``cost`` chars from the aggregate budget.
+
+        Returns True if the reservation succeeded (call may proceed).
+        Returns False if the call would exceed the remaining budget.
+        When unlimited, always returns True without tracking.
+
+        A single oversized call is rejected without consuming budget,
+        so smaller subsequent calls may still succeed. The first rejection
+        sets the ``rejected`` flag monotonically so callers can emit
+        exactly one warning per task.
+        """
+        if self._budget == 0:
+            return True
+        if cost <= 0:
+            return True
+        with self._lock:
+            if self._remaining < cost:
+                self._rejected = True
+                return False
+            self._remaining -= cost
+            return True
+
+    def take_first_rejection_warning(self) -> bool:
+        """Atomically return True exactly once when budget has ever rejected.
+
+        Used for one-time observability: the caller that gets True emits a
+        warning; all subsequent callers get False. This guarantees at most
+        one warning per task regardless of how many calls are skipped.
+        """
+        if self._budget == 0:
+            return False
+        with self._lock:
+            if not self._rejected or self._warning_taken:
+                return False
+            self._warning_taken = True
+            return True
+
+    @property
+    def remaining(self) -> int:
+        if self._budget == 0:
+            return -1
+        with self._lock:
+            return self._remaining
+
+    @property
+    def total_budget(self) -> int:
+        return self._budget
 
 
 class SemanticNodeScheduler:
@@ -222,6 +310,9 @@ class SemanticDagExecutor:
         self._dir_change_status: Dict[str, bool] = {}
         self._overview_cache: Dict[str, Dict[str, str]] = {}
         self._overview_cache_lock = asyncio.Lock()
+        self._summary_budget = SummaryBudget(
+            get_openviking_config().semantic.max_summary_input_chars
+        )
 
     async def run(self, root_uri: str) -> None:
         """Run DAG execution starting from root_uri."""
@@ -696,7 +787,10 @@ class SemanticDagExecutor:
                 self._file_change_status[file_path] = True
             if summary_dict is None:
                 summary_dict = await self._processor._generate_single_file_summary(
-                    file_path, llm_sem=self._llm_sem, ctx=self._ctx
+                    file_path,
+                    llm_sem=self._llm_sem,
+                    ctx=self._ctx,
+                    summary_budget=self._summary_budget,
                 )
         except Exception as e:
             logger.warning(f"Failed to generate summary for {file_path}: {e}")
@@ -840,7 +934,10 @@ class SemanticDagExecutor:
                     children_abstracts = await self._finalize_children_abstracts(node)
                 async with self._llm_sem:
                     overview = await self._processor._generate_overview(
-                        dir_uri, file_summaries, children_abstracts
+                        dir_uri,
+                        file_summaries,
+                        children_abstracts,
+                        summary_budget=self._summary_budget,
                     )
                 overview, abstract = self._processor._normalize_overview_generation(overview)
 

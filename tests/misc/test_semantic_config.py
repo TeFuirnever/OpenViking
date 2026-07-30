@@ -105,3 +105,21 @@ def test_memory_chunk_config_rejects_non_progressing_overlap(chunk_chars, overla
     """Memory chunk settings must guarantee chunking advances."""
     with pytest.raises(ValueError, match="memory_chunk"):
         SemanticConfig(memory_chunk_chars=chunk_chars, memory_chunk_overlap=overlap)
+
+
+def test_max_summary_input_chars_default_is_exact_2m():
+    """Default aggregate limit is a concrete 2M chars."""
+    config = SemanticConfig()
+    assert config.max_summary_input_chars == 2_000_000
+
+
+def test_max_summary_input_chars_zero_means_unlimited():
+    """0 disables the budget (unlimited — opt-out for advanced users)."""
+    config = SemanticConfig(max_summary_input_chars=0)
+    assert config.max_summary_input_chars == 0
+
+
+def test_max_summary_input_chars_rejects_negative():
+    """Negative budget is invalid and rejected."""
+    with pytest.raises(ValueError, match="max_summary_input_chars"):
+        SemanticConfig(max_summary_input_chars=-1)

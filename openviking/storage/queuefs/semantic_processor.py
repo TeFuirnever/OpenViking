@@ -7,7 +7,10 @@ import re
 import threading
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+
+if TYPE_CHECKING:
+    from openviking.storage.queuefs.semantic_dag import SummaryBudget
 
 from openviking.observability.context import (
     bind_root_observability_context,
@@ -31,7 +34,6 @@ from openviking.parse.parsers.media.utils import (
     get_media_type,
 )
 from openviking.prompts import render_prompt
-from openviking.utils.ingest_options import IngestOptions
 from openviking.server.identity import RequestContext, Role
 from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
@@ -49,6 +51,7 @@ from openviking.utils.circuit_breaker import (
     CircuitBreakerOpen,
     classify_api_error,
 )
+from openviking.utils.ingest_options import IngestOptions
 from openviking.utils.model_retry import ERROR_CLASS_INPUT_TOO_LARGE, ERROR_CLASS_PERMANENT
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import VikingURI
@@ -1053,12 +1056,49 @@ class SemanticProcessor(DequeueHandlerBase):
         except Exception as e:
             logger.error(f"[SyncDiff] Failed to rewrite image URIs for {target_uri}: {e}")
 
+    async def _vlm_summary_call(
+        self,
+        prompt: str,
+        llm_sem: asyncio.Semaphore,
+        summary_budget: Optional["SummaryBudget"] = None,
+    ) -> Optional[str]:
+        """Call VLM for a summary/overview prompt with aggregate budget enforcement.
+
+        Atomically reserves the exact rendered-prompt character count from
+        the task-level aggregate limit immediately before each real
+        get_completion_async call. Returns None if this specific prompt
+        would exceed the remaining budget.
+
+        Logs one warning per task on the first rejection (not per skipped
+        call) so operators can see the guardrail activated without log spam.
+        Note: a single oversized prompt is rejected without consuming
+        budget, so smaller subsequent calls may still succeed.
+        """
+        prompt_len = len(prompt)
+        if summary_budget is not None and not summary_budget.try_reserve(prompt_len):
+            if summary_budget.take_first_rejection_warning():
+                logger.warning(
+                    "VLM summary input limit (%d chars) reached: "
+                    "rejected prompt of %d chars with %d remaining. "
+                    "Oversized individual calls are skipped; smaller "
+                    "subsequent calls may still succeed. "
+                    "Vectorization and indexing continue with empty summaries.",
+                    summary_budget.total_budget,
+                    prompt_len,
+                    summary_budget.remaining,
+                )
+            return None
+        async with llm_sem:
+            with bind_telemetry_stage("resource_summarize"):
+                return await get_openviking_config().vlm.get_completion_async(prompt)
+
     async def _generate_text_summary(
         self,
         file_path: str,
         file_name: str,
         llm_sem: asyncio.Semaphore,
         ctx: Optional[RequestContext] = None,
+        summary_budget: Optional["SummaryBudget"] = None,
     ) -> Dict[str, Any]:
         """Generate summary for a single text file (code, documentation, or other text)."""
         viking_fs = get_viking_fs()
@@ -1116,9 +1156,11 @@ class SemanticProcessor(DequeueHandlerBase):
                                 "output_language": output_language,
                             },
                         )
-                        async with llm_sem:
-                            with bind_telemetry_stage("resource_summarize"):
-                                summary = await vlm.get_completion_async(prompt)
+                        summary = await self._vlm_summary_call(
+                            prompt, llm_sem, summary_budget=summary_budget
+                        )
+                        if summary is None:
+                            return result("")
                         return result(summary.strip())
                 if skeleton_text is None:
                     logger.info("AST unsupported language, fallback to LLM: %s", file_path)
@@ -1130,9 +1172,9 @@ class SemanticProcessor(DequeueHandlerBase):
                 "semantic.code_summary",
                 {"file_name": file_name, "content": content, "output_language": output_language},
             )
-            async with llm_sem:
-                with bind_telemetry_stage("resource_summarize"):
-                    summary = await vlm.get_completion_async(prompt)
+            summary = await self._vlm_summary_call(prompt, llm_sem, summary_budget=summary_budget)
+            if summary is None:
+                return result("")
             return result(summary.strip())
 
         elif file_type == FILE_TYPE_DOCUMENTATION:
@@ -1145,9 +1187,9 @@ class SemanticProcessor(DequeueHandlerBase):
             {"file_name": file_name, "content": content, "output_language": output_language},
         )
 
-        async with llm_sem:
-            with bind_telemetry_stage("resource_summarize"):
-                summary = await vlm.get_completion_async(prompt)
+        summary = await self._vlm_summary_call(prompt, llm_sem, summary_budget=summary_budget)
+        if summary is None:
+            return result("")
         return result(summary.strip())
 
     async def _generate_single_file_summary(
@@ -1155,11 +1197,15 @@ class SemanticProcessor(DequeueHandlerBase):
         file_path: str,
         llm_sem: Optional[asyncio.Semaphore] = None,
         ctx: Optional[RequestContext] = None,
+        summary_budget: Optional["SummaryBudget"] = None,
     ) -> Dict[str, Any]:
         """Generate summary for a single file.
 
         Args:
             file_path: File path
+            summary_budget: Optional per-task aggregate VLM input limit.
+                When provided and a single prompt would exceed the
+                remaining budget, that VLM summary call is skipped.
 
         Returns:
             {"name": file_name, "summary": summary_content}; text files also carry
@@ -1175,7 +1221,9 @@ class SemanticProcessor(DequeueHandlerBase):
         elif media_type == "video":
             return await generate_video_summary(file_path, file_name, llm_sem, ctx=ctx)
         else:
-            return await self._generate_text_summary(file_path, file_name, llm_sem, ctx=ctx)
+            return await self._generate_text_summary(
+                file_path, file_name, llm_sem, ctx=ctx, summary_budget=summary_budget
+            )
 
     def _replace_index_references(
         self, generated_content: str, file_index_map: Dict[int, str]
@@ -1313,6 +1361,7 @@ class SemanticProcessor(DequeueHandlerBase):
         file_summaries: List[Dict[str, str]],
         children_abstracts: List[Dict[str, str]],
         llm_sem: Optional[asyncio.Semaphore] = None,
+        summary_budget: Optional["SummaryBudget"] = None,
     ) -> str:
         """Generate raw directory overview model output.
 
@@ -1325,6 +1374,9 @@ class SemanticProcessor(DequeueHandlerBase):
             dir_uri: Directory URI
             file_summaries: File summary list
             children_abstracts: Subdirectory summary list
+            summary_budget: Optional per-task aggregate VLM input limit.
+                When provided and a prompt would exceed the remaining
+                budget, that overview call is skipped (returns placeholder).
 
         Returns:
             Markdown overview content generated by the model.
@@ -1385,6 +1437,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 file_index_map,
                 llm_sem=llm_sem,
                 output_language=output_language,
+                summary_budget=summary_budget,
             )
         elif over_budget:
             # Few files but long summaries → truncate summaries to fit budget
@@ -1407,6 +1460,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 children_abstracts_str,
                 file_index_map,
                 output_language=output_language,
+                summary_budget=summary_budget,
             )
         else:
             overview = await self._single_generate_overview(
@@ -1415,6 +1469,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 children_abstracts_str,
                 file_index_map,
                 output_language=output_language,
+                summary_budget=summary_budget,
             )
 
         return overview
@@ -1426,11 +1481,9 @@ class SemanticProcessor(DequeueHandlerBase):
         children_abstracts_str: str,
         file_index_map: Dict[int, str],
         output_language: str = "en",
+        summary_budget: Optional["SummaryBudget"] = None,
     ) -> str:
         """Generate overview from a single prompt (small directories)."""
-        config = get_openviking_config()
-        vlm = config.vlm
-
         try:
             prompt = render_prompt(
                 "semantic.overview_generation",
@@ -1442,8 +1495,13 @@ class SemanticProcessor(DequeueHandlerBase):
                 },
             )
 
-            with bind_telemetry_stage("resource_summarize"):
-                overview = await vlm.get_completion_async(prompt)
+            overview = await self._vlm_summary_call(
+                prompt,
+                asyncio.Semaphore(self.max_concurrent_llm),
+                summary_budget=summary_budget,
+            )
+            if overview is None:
+                return f"# {dir_uri.split('/')[-1]}\n\n[Directory overview is not generated]"
 
             overview = self._replace_index_references(overview, file_index_map)
 
@@ -1464,15 +1522,14 @@ class SemanticProcessor(DequeueHandlerBase):
         file_index_map: Dict[int, str],
         llm_sem: Optional[asyncio.Semaphore] = None,
         output_language: str = "en",
+        summary_budget: Optional["SummaryBudget"] = None,
     ) -> str:
         """Generate overview by batching file and subdirectory summaries.
 
         Splits both input kinds into batches, generates a partial overview per
         batch, then merges the partials without repeating the raw inputs.
         """
-        config = get_openviking_config()
-        vlm = config.vlm
-        semantic = config.semantic
+        semantic = get_openviking_config().semantic
         batch_size = semantic.overview_batch_size
         dir_name = dir_uri.split("/")[-1]
 
@@ -1485,7 +1542,7 @@ class SemanticProcessor(DequeueHandlerBase):
         # Generate partial overviews concurrently using global file indices.
         if llm_sem is None:
             llm_sem = asyncio.Semaphore(self.max_concurrent_llm)
-        partial_overviews = [None] * len(batches)
+        partial_overviews: List[Optional[str]] = [None] * len(batches)
         batch_prompts: List[Tuple[int, str, Dict[int, str]]] = []
 
         for batch_idx, batch in enumerate(batches):
@@ -1513,11 +1570,12 @@ class SemanticProcessor(DequeueHandlerBase):
 
         async def _run_batch(batch_idx: int, prompt: str, batch_index_map: Dict[int, str]) -> None:
             try:
-                async with llm_sem:
-                    with bind_telemetry_stage("resource_summarize"):
-                        partial = await vlm.get_completion_async(prompt)
-                partial = self._replace_index_references(partial, batch_index_map)
-                partial_overviews[batch_idx] = partial.strip()
+                partial = await self._vlm_summary_call(
+                    prompt, llm_sem, summary_budget=summary_budget
+                )
+                if partial is not None:
+                    partial = self._replace_index_references(partial, batch_index_map)
+                    partial_overviews[batch_idx] = partial.strip()
             except Exception as e:
                 logger.warning(
                     f"Failed to generate partial overview batch "
@@ -1546,8 +1604,9 @@ class SemanticProcessor(DequeueHandlerBase):
                     "output_language": output_language,
                 },
             )
-            with bind_telemetry_stage("resource_summarize"):
-                overview = await vlm.get_completion_async(prompt)
+            overview = await self._vlm_summary_call(prompt, llm_sem, summary_budget=summary_budget)
+            if overview is None:
+                return partial_overviews[0]
             overview = self._replace_index_references(overview, file_index_map)
             return overview.strip()
         except Exception as e:

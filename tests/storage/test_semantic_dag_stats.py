@@ -38,10 +38,14 @@ class _FakeProcessor:
         self.vectorized_dirs = []
         self.vectorized_files = []
 
-    async def _generate_single_file_summary(self, file_path, llm_sem=None, ctx=None):
+    async def _generate_single_file_summary(
+        self, file_path, llm_sem=None, ctx=None, summary_budget=None
+    ):
         return {"name": file_path.split("/")[-1], "summary": "summary"}
 
-    async def _generate_overview(self, dir_uri, file_summaries, children_abstracts):
+    async def _generate_overview(
+        self, dir_uri, file_summaries, children_abstracts, summary_budget=None
+    ):
         return "overview"
 
     def _normalize_overview_generation(self, overview):
@@ -74,7 +78,9 @@ class _TrackingProcessor(_FakeProcessor):
         self.active_summaries = 0
         self.max_active_summaries = 0
 
-    async def _generate_single_file_summary(self, file_path, llm_sem=None, ctx=None):
+    async def _generate_single_file_summary(
+        self, file_path, llm_sem=None, ctx=None, summary_budget=None
+    ):
         self.active_summaries += 1
         self.max_active_summaries = max(self.max_active_summaries, self.active_summaries)
         try:

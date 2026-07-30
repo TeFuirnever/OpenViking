@@ -58,11 +58,15 @@ class _FakeProcessor:
             results[m.group("name").strip()] = m.group("summary").strip()
         return results
 
-    async def _generate_single_file_summary(self, file_path, llm_sem=None, ctx=None):
+    async def _generate_single_file_summary(
+        self, file_path, llm_sem=None, ctx=None, summary_budget=None
+    ):
         self.summarized_files.append(file_path)
         return {"name": file_path.split("/")[-1], "summary": "summary"}
 
-    async def _generate_overview(self, dir_uri, file_summaries, children_abstracts):
+    async def _generate_overview(
+        self, dir_uri, file_summaries, children_abstracts, summary_budget=None
+    ):
         lines = ["FILES:"]
         for item in file_summaries:
             name = item.get("name", "")

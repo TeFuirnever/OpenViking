@@ -750,6 +750,19 @@ class SemanticConfig:
     memory_chunk_overlap: int = 200
     """Character overlap between adjacent memory chunks for context continuity."""
 
+    max_summary_input_chars: int = 2_000_000
+    """Aggregate character limit on VLM prompt input per task for summary/overview generation.
+
+    0 means unlimited. This caps cumulative input across all per-file summaries,
+    directory overviews, and batched overview merges within a single semantic
+    processing task (one SemanticMsg / one DAG executor). When a single
+    prompt would exceed the remaining budget, that call is rejected and an
+    empty summary/overview is returned so that indexing and embedding
+    continue without unbounded VLM cost.
+
+    Default is 2M chars.
+    """
+
     def __post_init__(self):
         if self.memory_chunk_chars <= 0:
             raise ValueError("memory_chunk_chars must be positive")
@@ -757,6 +770,8 @@ class SemanticConfig:
             raise ValueError("memory_chunk_overlap must be non-negative")
         if self.memory_chunk_overlap >= self.memory_chunk_chars:
             raise ValueError("memory_chunk_overlap must be smaller than memory_chunk_chars")
+        if self.max_summary_input_chars < 0:
+            raise ValueError("max_summary_input_chars must be non-negative")
 
 
 # Configuration registry for dynamic loading
